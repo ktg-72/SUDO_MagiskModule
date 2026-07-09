@@ -1,0 +1,245 @@
+#!/system/bin/sh
+# sudo -- a close-as-reasonable emulation of GNU/BSD sudo, built on top of
+# Android's su. Designed to live directly in a $PATH directory (e.g. as
+# part of a Magisk module mounted at /system/bin/sudo) and Just Work
+# whether it's invoked from Termux, adb shell, a Magisk service script,
+# or anywhere else on the device.
+#
+# Honesty note: this is a convenience wrapper, not a real security boundary.
+# There's no actual password check -- Android's root grant (Magisk, etc.)
+# is the only real gate. The "sudoers" file and logging here are for
+# workflow parity (habits, an audit trail you control), not genuine
+# privilege separation.
+
+# ---------- Shell hand-off shim ----------
+# Android's default /system/bin/sh (toybox sh or mksh, depending on device)
+# can't parse the bash-specific syntax below (arrays, [[ ]], local, etc).
+# If we're not already running under bash, find one -- Termux's bash is
+# the most likely candidate sitting on the same device -- and re-exec this
+# same file through it.
+if [ -z "$BASH_VERSION" ]; then
+  for candidate in \
+    /data/data/com.termux/files/usr/bin/bash \
+    /system/bin/bash \
+    /system/xbin/bash \
+    /vendor/bin/bash
+  do
+    if [ -x "$candidate" ]; then
+      exec "$candidate" "$0" "$@"
+    fi
+  done
+  # last resort: see if something on PATH resolves
+  if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  fi
+  echo "sudo: no bash interpreter found on this device." >&2
+  echo "sudo: install Termux (or any bash binary) for this command to work." >&2
+  exit 127
+fi
+
+# ---------- From here on, guaranteed to be running under bash ----------
+
+# $HOME can be unset or point somewhere unwritable depending on which
+# context invoked us (Termux vs. plain adb shell vs. a Magisk service
+# script), so pin a sane fallback rather than trusting it blindly.
+: "${HOME:=/data/local/tmp}"
+
+SUDO_DIR="$HOME/.sudo.d"
+SUDOERS_FILE="$SUDO_DIR/sudoers"
+LOG_FILE="$SUDO_DIR/sudo.log"
+TS_FILE="$SUDO_DIR/timestamp"
+LECTURE_FILE="$SUDO_DIR/lecture_shown"
+TIMEOUT_MIN="${SUDO_TIMEOUT:-5}"   # minutes -- mirrors sudo's default timestamp_timeout
+
+mkdir -p "$SUDO_DIR" 2>/dev/null
+[ -f "$SUDOERS_FILE" ] || echo "ALL" > "$SUDOERS_FILE" 2>/dev/null   # default: everything allowed
+touch "$LOG_FILE" 2>/dev/null
+
+main() {
+  local target_user="root"
+  local login_shell=false run_shell=false preserve_env=false
+  local background=false noninteractive=false
+  local do_validate=false do_kill=false do_list=false edit_mode=false
+  local args=()
+
+  # ---------- Option parsing ----------
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -u|--user)              target_user="$2"; shift 2 ;;
+      -i|--login)              login_shell=true; shift ;;
+      -s|--shell)              run_shell=true; shift ;;
+      -e|--edit)               edit_mode=true; shift ;;
+      -l|--list)               do_list=true; shift ;;
+      -v|--validate)           do_validate=true; shift ;;
+      -k|--reset-timestamp|-K) do_kill=true; shift ;;
+      -b|--background)         background=true; shift ;;
+      -n|--non-interactive)    noninteractive=true; shift ;;
+      -E|--preserve-env)       preserve_env=true; shift ;;
+      -H)                      shift ;;  # accepted for compatibility; su already sets HOME
+      -h|--help)               _sudo_help; return 0 ;;
+      -V|--version)            echo "sudo (Android/su emulation) 2.0"; return 0 ;;
+      --)                      shift; args+=("$@"); break ;;
+      -*)
+        echo "sudo: unknown option: $1" >&2
+        echo "sudo: try 'sudo --help'" >&2
+        return 1 ;;
+      *)
+        args+=("$@"); break ;;
+    esac
+  done
+
+  # ---------- -k / -K: drop cached auth ----------
+  if $do_kill; then
+    rm -f "$TS_FILE"
+    echo "sudo: timestamp invalidated"
+    return 0
+  fi
+
+  # ---------- -l: list "permissions" ----------
+  if $do_list; then
+    echo "User $(whoami 2>/dev/null || id -un) may run the following commands on this device:"
+    cat "$SUDOERS_FILE"
+    return 0
+  fi
+
+  # ---------- Permission check against a sudoers-style allow-list ----------
+  if ! grep -qx "ALL" "$SUDOERS_FILE" 2>/dev/null; then
+    local cmd_name="${args[0]}"
+    if [ -n "$cmd_name" ] && ! grep -qx "$cmd_name" "$SUDOERS_FILE" 2>/dev/null; then
+      echo "sudo: Sorry, user $(whoami 2>/dev/null || id -un) is not allowed to execute '$cmd_name' as $target_user." >&2
+      echo "$(date '+%Y-%m-%d %H:%M:%S') DENIED $(whoami 2>/dev/null || id -un) : command not in sudoers : $cmd_name ${args[*]:1}" >> "$LOG_FILE"
+      return 1
+    fi
+  fi
+
+  # ---------- First-run lecture, just like real sudo ----------
+  if [ ! -f "$LECTURE_FILE" ]; then
+    cat <<'EOF'
+We trust you have received the usual lecture from the local System
+Administrator. It usually boils down to these three things:
+
+    #1) Respect the privacy of others.
+    #2) Think before you type.
+    #3) With great power comes great responsibility.
+
+EOF
+    touch "$LECTURE_FILE" 2>/dev/null
+  fi
+
+  # ---------- Timestamp / "password" caching ----------
+  local now ts_epoch age_min
+  now=$(date +%s)
+  ts_epoch=$( [ -f "$TS_FILE" ] && cat "$TS_FILE" 2>/dev/null || echo 0)
+  age_min=$(( (now - ts_epoch) / 60 ))
+
+  if [ "$age_min" -ge "$TIMEOUT_MIN" ]; then
+    if $noninteractive; then
+      echo "sudo: a password is required" >&2
+      return 1
+    fi
+    # Forces the Magisk/root-manager grant prompt if not already
+    # remembered -- the closest analogue here to "entering your password."
+    if ! su -c true 2>/dev/null; then
+      echo "sudo: authentication failed (root access denied)" >&2
+      echo "$(date '+%Y-%m-%d %H:%M:%S') AUTH-FAIL $(whoami 2>/dev/null || id -un)" >> "$LOG_FILE"
+      return 1
+    fi
+    echo "$now" > "$TS_FILE" 2>/dev/null
+  fi
+
+  # ---------- -v: validate only ----------
+  if $do_validate; then
+    echo "sudo: timestamp refreshed"
+    return 0
+  fi
+
+  # ---------- Environment preservation ----------
+  local env_prefix=""
+  if $preserve_env; then
+    env_prefix=$(export -p | sed 's/^declare -x //' | tr '\n' ' ')
+  fi
+
+  # ---------- -e / sudoedit: edit a file as root, safely ----------
+  if $edit_mode; then
+    local target_file="${args[0]}"
+    if [ -z "$target_file" ]; then
+      echo "sudo: no file specified for -e" >&2
+      return 1
+    fi
+    local tmp before after
+    tmp=$(mktemp)
+    su -c "cat '$target_file'" > "$tmp" 2>/dev/null
+    before=$(md5sum "$tmp" | awk '{print $1}')
+    "${EDITOR:-nano}" "$tmp"
+    after=$(md5sum "$tmp" | awk '{print $1}')
+    if [ "$before" != "$after" ]; then
+      su -c "cat > '$target_file'" < "$tmp"
+      echo "sudo: '$target_file' updated"
+      echo "$(date '+%Y-%m-%d %H:%M:%S') EDIT $(whoami 2>/dev/null || id -un) : $target_file" >> "$LOG_FILE"
+    else
+      echo "sudo: no changes made to '$target_file'"
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # ---------- -i: full login shell as target user ----------
+  if $login_shell; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') LOGIN-SHELL $(whoami 2>/dev/null || id -un) -> $target_user" >> "$LOG_FILE"
+    if [ "$target_user" = "root" ]; then
+      su -l
+    else
+      su "$target_user" -l
+    fi
+    return $?
+  fi
+
+  # ---------- -s: run $SHELL as target user ----------
+  if $run_shell; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SHELL $(whoami 2>/dev/null || id -un) -> $target_user" >> "$LOG_FILE"
+    su "$target_user" -c "${env_prefix}${SHELL:-bash}"
+    return $?
+  fi
+
+  # ---------- Normal command execution ----------
+  if [ ${#args[@]} -eq 0 ]; then
+    echo "sudo: no command specified" >&2
+    return 1
+  fi
+
+  local full_cmd="${env_prefix}${args[*]}"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $(whoami 2>/dev/null || id -un) : $target_user : ${args[*]}" >> "$LOG_FILE"
+
+  if $background; then
+    ( su "$target_user" -c "$full_cmd" & )
+    echo "sudo: command backgrounded"
+  else
+    su "$target_user" -c "$full_cmd"
+  fi
+}
+
+_sudo_help() {
+  cat <<'EOF'
+Usage: sudo [OPTION]... COMMAND [ARG]...
+
+  -u, --user USER         run command as USER instead of root
+  -i, --login             run a login shell as the target user
+  -s, --shell             run $SHELL as the target user
+  -e, --edit FILE         edit FILE as root, then write changes back safely
+  -l, --list              list allowed commands from the local sudoers file
+  -v, --validate          refresh the cached authentication timestamp
+  -k, --reset-timestamp   drop cached authentication, re-prompt next time
+  -b, --background        run the command in the background
+  -n, --non-interactive   fail instead of prompting if not authenticated
+  -E, --preserve-env      carry your current shell's environment into root
+  -H                      accepted for compatibility (su already sets HOME)
+  -h, --help              show this help
+  -V, --version           show version info
+
+Config:
+  $HOME/.sudo.d/sudoers   one allowed command name per line, or "ALL"
+  $HOME/.sudo.d/sudo.log  every invocation is logged here
+EOF
+}
+
+main "$@"
